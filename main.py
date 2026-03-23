@@ -3,6 +3,7 @@ import scipy.io.wavfile as wav
 import scipy.signal as signal
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 from pathlib import Path
 import warnings
 
@@ -228,6 +229,24 @@ def rms_envelope(audio: np.ndarray, rate: int, window_ms: float = 30.0) -> tuple
     return t, env
 
 
+def compare_amp_vs_power_fit(freqs: np.ndarray, amps: np.ndarray, string_name: str):
+    """
+    Compare Huber M-estimator fits for freq ~ RMS vs freq ~ RMS².
+
+    R² is inappropriate for robust regression (it measures OLS residuals, not
+    the Huber objective). Instead we compare result.scale, which is the robust
+    scale estimate (MAD-based) from each M-estimator — directly analogous to σ̂
+    in OLS. Lower scale = tighter residuals under the Huber norm = better fit.
+    """
+    huber = sm.robust.norms.HuberT()
+    result_amp = sm.RLM(freqs, sm.add_constant(amps),      M=huber).fit()
+    result_pow = sm.RLM(freqs, sm.add_constant(amps ** 2), M=huber).fit()
+    s_amp = result_amp.scale
+    s_pow = result_pow.scale
+    winner = "RMS" if s_amp <= s_pow else "RMS²"
+    print(f"  [{string_name}] Robust scale: RMS={s_amp:.4f}  RMS²={s_pow:.4f}  → {winner} fits better")
+
+
 def plot_blog_figures(audio, rate, onset_samples, freqs, amps, matched_onsets,
                       flux, hop_size, string_name: str, nominal_hz: float,
                       prefix: str):
@@ -291,32 +310,26 @@ def plot_blog_figures(audio, rate, onset_samples, freqs, amps, matched_onsets,
     plt.close(fig1)
 
     # ── Figure 2: Scatter + Huber regression (the main result) ──
-    fig2, ax2 = plt.subplots(figsize=(7, 5.5))
+    fig2, ax2 = plt.subplots(figsize=(10, 5))
 
     ax2.scatter(amps, freqs, alpha=0.55, s=35, color=ORANGE, edgecolors=DARK,
                 linewidths=0.4, zorder=3)
 
-    X = sm.add_constant(amps)
-    huber = sm.RLM(freqs, X, M=sm.robust.norms.HuberT())
-    result = huber.fit()
-    slope = result.params[1]
-    intercept = result.params[0]
+    huber = sm.robust.norms.HuberT()
+    result_quad = sm.RLM(freqs, sm.add_constant(amps ** 2), M=huber).fit()
 
     amp_range = np.linspace(amps.min(), amps.max(), 200)
-    fit_line = intercept + slope * amp_range
-    ax2.plot(amp_range, fit_line, color=RED, linewidth=2.5, zorder=4, label="Robust linear fit")
+    fit_quad = result_quad.params[0] + result_quad.params[1] * amp_range ** 2
 
-    # Reference line at nominal frequency
-    ax2.axhline(nominal_hz, color=GRAY, linestyle=":", linewidth=1, alpha=0.7)
-    ax2.text(amps.max() * 0.98, nominal_hz + (freqs.max() - freqs.min()) * 0.03,
-             f"{string_name} = {nominal_hz:.1f} Hz", ha="right", fontsize=8, color=GRAY)
+    ax2.plot(amp_range, fit_quad, color="#7C3AED", linewidth=2.5, zorder=2)
 
-    # Stats annotation
-    cents_range = 1200 * np.log2((intercept + slope * amps.max()) / (intercept + slope * amps.min()))
+    # Annotation: formula + p-value (replaces separate legend)
+    a, b = result_quad.params
+    pval = result_quad.pvalues[1]
+    pval_str = "< 0.001" if pval < 0.001 else f"= {pval:.3f}"
     stats_text = (
-        f"slope = {slope:.2f} Hz / RMS unit\n"
-        f"p < 0.001 (z = {result.tvalues[1]:.1f})\n"
-        f"total pitch shift: {cents_range:.0f} cents (approx. {cents_range/100:.1f} semitones)"
+        f"f\u0302 = {a:.2f} + {b:.4f}\u00b7RMS\u00b2\n"
+        f"p {pval_str}  (Huber robust fit)"
     )
     ax2.text(0.03, 0.97, stats_text, transform=ax2.transAxes,
              fontsize=9, verticalalignment="top", fontfamily="monospace",
@@ -327,7 +340,18 @@ def plot_blog_figures(audio, rate, onset_samples, freqs, amps, matched_onsets,
     ax2.set_ylabel("Detected Pitch (Hz)", fontsize=11)
     ax2.set_title(f"{string_name} String: Harder Plucks Go Sharper",
                   fontsize=14, fontweight="bold", pad=12)
-    ax2.legend(loc="lower right", fontsize=9, framealpha=0.9)
+
+    # Right axis: cents from zero-intensity baseline (fit intercept) — dashed
+    baseline_hz = result_quad.params[0]
+    ax2r = ax2.twinx()
+    hz_lo, hz_hi = ax2.get_ylim()
+    ax2r.set_ylim(1200 * np.log2(hz_lo / baseline_hz),
+                  1200 * np.log2(hz_hi / baseline_hz))
+    ax2r.yaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda x, _: f"{x:+.0f}")
+    )
+    ax2r.set_ylabel("Cents from baseline", fontsize=11)
+    ax2r.axhline(0, color=GRAY, linestyle="--", linewidth=1, alpha=0.6)
 
     fig2.tight_layout()
     fig2.savefig(f"{prefix}_fig2_scatter.png", dpi=180, bbox_inches="tight")
@@ -346,30 +370,22 @@ def plot_blog_figures(audio, rate, onset_samples, freqs, amps, matched_onsets,
     show_ms = max(period_ms * 3.5, 10)  # at least 3.5 periods, min 10ms
     show_samples = int(show_ms / 1000 * rate)
 
+    soft_freq = freqs[quiet_idx]
+    hard_freq = freqs[loud_idx]
+    cents_diff = 1200 * np.log2(hard_freq / soft_freq)
+
     for ax, idx, label, color in [
         (ax3a, quiet_idx, "Soft Pluck", BLUE),
         (ax3b, loud_idx, "Hard Pluck", RED),
     ]:
         target_amp = amps[idx]
         target_freq = freqs[idx]
-
-        # Find which onset this was by matching RMS
+        onset = matched_onsets[idx]
         n_skip = int(0.05 * rate)
-        best_onset = None
-        best_diff = float("inf")
-        for onset in onset_samples:
-            start = onset + n_skip
-            seg = audio[start:start + int(0.15 * rate)]
-            if len(seg) < int(0.15 * rate) // 2:
-                continue
-            rms = np.sqrt(np.mean(seg**2))
-            diff = abs(rms - target_amp)
-            if diff < best_diff:
-                best_diff = diff
-                best_onset = onset
 
-        seg = audio[best_onset:best_onset + show_samples]
-        t_ms = np.arange(len(seg)) / rate * 1000
+        seg = audio[onset + n_skip:onset + n_skip + show_samples]
+        skip_ms = n_skip / rate * 1000
+        t_ms = np.arange(len(seg)) / rate * 1000 + skip_ms
 
         ax.plot(t_ms, seg, linewidth=0.8, color=color, alpha=0.85)
         ax.fill_between(t_ms, seg, alpha=0.1, color=color)
@@ -378,15 +394,15 @@ def plot_blog_figures(audio, rate, onset_samples, freqs, amps, matched_onsets,
             f"{label}:  {target_freq:.1f} Hz,  RMS = {target_amp:.3f}",
             fontsize=11, fontweight="bold", pad=8,
         )
-        ax.set_xlim(0, show_ms)
+        ax.set_xlim(skip_ms, skip_ms + show_ms)
 
         # Mark one period between actual peaks
         min_lag = int(0.5 / target_freq * rate)
         peaks, _ = signal.find_peaks(seg, distance=min_lag, height=seg.max() * 0.3)
         if len(peaks) >= 2:
             p1, p2 = peaks[0], peaks[1]
-            t1 = p1 / rate * 1000
-            t2 = p2 / rate * 1000
+            t1 = p1 / rate * 1000 + skip_ms
+            t2 = p2 / rate * 1000 + skip_ms
             y_arrow = max(seg[p1], seg[p2]) * 1.15
             ax.annotate("", xy=(t2, y_arrow), xytext=(t1, y_arrow),
                          arrowprops=dict(arrowstyle="<->", color=DARK, lw=1.5))
@@ -400,15 +416,17 @@ def plot_blog_figures(audio, rate, onset_samples, freqs, amps, matched_onsets,
 
     ax3a.set_ylabel("Amplitude")
 
-    fig3.suptitle(f"{string_name} String: Comparing a Soft and Hard Pluck",
-                  fontsize=13, fontweight="bold", y=1.02)
+    fig3.text(0.5, 1.04, f"{string_name} String: Comparing a Soft and Hard Pluck",
+              ha="center", fontsize=13, fontweight="bold", transform=fig3.transFigure)
+    fig3.text(0.5, 1.00, f"hard pluck is {cents_diff:+.1f} cents vs. soft",
+              ha="center", fontsize=10, color=GRAY, transform=fig3.transFigure)
     fig3.tight_layout()
     fig3.savefig(f"{prefix}_fig3_comparison.png", dpi=180, bbox_inches="tight")
     print(f"  Saved {prefix}_fig3_comparison.png")
     plt.close(fig3)
 
-    print(f"\n  --- Huber Regression ({string_name}) ---")
-    print(result.summary2())
+    print(f"\n  --- Huber Regression ({string_name}): quadratic (freq ~ RMS²) ---")
+    print(result_quad.summary2())
 
 
 def analyze_file(wav_path: Path):
@@ -438,15 +456,63 @@ def analyze_file(wav_path: Path):
         print(f"  WARNING: Too few plucks ({len(freqs)}) — skipping plots")
         return
 
+    compare_amp_vs_power_fit(freqs, amps, string_name)
     plot_blog_figures(audio, rate, onset_samples, freqs, amps, matched_onsets,
                       flux, hop_size, string_name, nominal_hz, prefix)
+
+    # Return stats for summary table
+    huber = sm.robust.norms.HuberT()
+    r_lin  = sm.RLM(freqs, sm.add_constant(amps),    M=huber).fit()
+    r_quad = sm.RLM(freqs, sm.add_constant(amps**2), M=huber).fit()
+    p95_amp = np.percentile(amps, 95)
+    baseline_hz = r_quad.params[0]
+    cents_p95 = 1200 * np.log2((baseline_hz + r_quad.params[1] * p95_amp**2) / baseline_hz)
+    pval = r_quad.pvalues[1]
+    return {
+        "name": string_name,
+        "nominal_hz": nominal_hz,
+        "n": len(freqs),
+        "a": r_quad.params[0],
+        "b": r_quad.params[1],
+        "pval": pval,
+        "scale_lin": r_lin.scale,
+        "scale_quad": r_quad.scale,
+        "p95_amp": p95_amp,
+        "cents_p95": cents_p95,
+    }
+
+
+def print_summary_table(rows: list[dict]):
+    """Print a markdown summary table of fit results across strings."""
+    header = (
+        r"| String | $n$ | $\hat{f} = a + b\cdot\text{RMS}^2$ | $p$ | "
+        r"95th pct RMS | $\Delta$ cents at 95th pct |"
+    )
+    sep = "|---|---|---|---|---|---|"
+    print("\n\n## Summary\n")
+    print(header)
+    print(sep)
+    for r in rows:
+        pval_str = r"$< 0.001$" if r["pval"] < 0.001 else f"${r['pval']:.3f}$"
+        print(
+            f"| {r['name']} "
+            f"| ${r['n']}$ "
+            f"| ${r['a']:.2f} + {r['b']:.4f}\\cdot\\text{{RMS}}^2$ "
+            f"| {pval_str} "
+            f"| ${r['p95_amp']:.3f}$ "
+            f"| ${r['cents_p95']:+.1f}$ |"
+        )
 
 
 def main():
     wav_files = sorted(Path("data").glob("*.wav"))
     print(f"Found {len(wav_files)} wav files")
+    rows = []
     for wav_path in wav_files:
-        analyze_file(wav_path)
+        result = analyze_file(wav_path)
+        if result:
+            rows.append(result)
+    print_summary_table(rows)
 
 
 if __name__ == "__main__":
